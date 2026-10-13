@@ -583,10 +583,7 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
 
     assert result["final_response"] == "done"
     assert adapter.sent
-    expected_metadata = {
-        "thread_id": "1234567890.000001",
-        "message_id": "1234567890.000001",
-    }
+    expected_metadata = {"thread_id": "1234567890.000001", "message_id": "1234567890.000001"}
     assert adapter.sent[0]["metadata"] == expected_metadata
     assert all(call["metadata"] == expected_metadata for call in adapter.typing)
 
@@ -1949,12 +1946,8 @@ async def test_keep_typing_stops_immediately_when_interrupt_event_is_set():
     stop_event.set()
     await asyncio.wait_for(task, timeout=0.5)
 
-    normal_typing_calls = [
-        call for call in adapter.typing if call.get("metadata") != {"stopped": True}
-    ]
-    stopped_calls = [
-        call for call in adapter.typing if call.get("metadata") == {"stopped": True}
-    ]
+    normal_typing_calls = [call for call in adapter.typing if call.get("metadata") != {"stopped": True}]
+    stopped_calls = [call for call in adapter.typing if call.get("metadata") == {"stopped": True}]
     assert len(normal_typing_calls) == 1
     assert len(stopped_calls) == 1
 
@@ -2009,6 +2002,59 @@ class TerminalCommandAgent:
         return {"final_response": "done", "messages": [], "api_calls": 1}
 
 
+class PythonInvocationCommandAgent(TerminalCommandAgent):
+    """Emits a terminal tool.started with a multi-line python3 -c invocation wrapper."""
+
+    CMD = 'python3 -c "\nimport sys\nprint(sys.version)\n"'
+
+
+class ConsecutiveTerminalCommandsAgent(TerminalCommandAgent):
+    """Emits two consecutive terminal tool.started events."""
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        self.tool_progress_callback("tool.started", "terminal", "echo first", {"command": "echo first"})
+        time.sleep(0.1)  # health: allow HX013 -- progress drain interval
+        self.tool_progress_callback("tool.started", "terminal", "echo second", {"command": "echo second"})
+        time.sleep(0.35)  # health: allow HX013 -- progress drain interval
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class DeduplicatedTerminalCommandsAgent(TerminalCommandAgent):
+    """Emits duplicate terminal tool.started events."""
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        for _ in range(3):
+            self.tool_progress_callback("tool.started", "terminal", "echo test", {"command": "echo test"})
+            time.sleep(0.1)  # health: allow HX013 -- progress drain interval
+        time.sleep(0.25)  # health: allow HX013 -- progress drain interval
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+async def _run_terminal_progress(monkeypatch, tmp_path, agent_cls, mode="all", return_adapter=False):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", mode)
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = agent_cls
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.terminal_tool
+    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", thread_id=None)
+    result = await runner._run_agent(
+        message="hello", context_prompt="", history=[], source=source,
+        session_id=f"sess-terminal-{mode}", session_key="agent:main:telegram:dm:12345",
+    )
+    assert result["final_response"] == "done"
+    if return_adapter:
+        return adapter
+    return " ".join(call["content"] for call in adapter.sent) + " " + " ".join(call["content"] for call in adapter.edits)
+
+
 @pytest.mark.asyncio
 async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path):
     """Terminal progress on a markdown-capable (supports_code_blocks) gateway
@@ -2016,100 +2062,57 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
     'bash' as a literal first code line).  In non-verbose ("all"/"new") mode the
     command is collapsed to a single line capped at tool_preview_length so a long
     or multi-line command doesn't render as a huge block (#42634)."""
-    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
-
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
-
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = TerminalCommandAgent
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-    import tools.terminal_tool
-
-    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
-    runner = _make_runner(adapter)
-    gateway_run = importlib.import_module("gateway.run")
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
-
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="12345",
-        chat_type="dm",
-        thread_id=None,
-    )
-
-    result = await runner._run_agent(
-        message="hello",
-        context_prompt="",
-        history=[],
-        source=source,
-        session_id="sess-terminal-code-block",
-        session_key="agent:main:telegram:dm:12345",
-    )
-
-    assert result["final_response"] == "done"
-    all_content = " ".join(call["content"] for call in adapter.sent)
-    all_content += " ".join(call["content"] for call in adapter.edits)
-    # Bare fenced block, no language tag (no '```bash').
-    assert "```" in all_content
-    assert "```bash" not in all_content
-    # Non-verbose collapses to the first line + truncation marker — the later
-    # command lines must NOT appear (this was the "huge block" regression).
+    all_content = await _run_terminal_progress(monkeypatch, tmp_path, TerminalCommandAgent, "all")
+    assert "```" in all_content and "```bash" not in all_content
     assert "set -euo pipefail" in all_content
-    assert "npm install -g hyperframes@latest" not in all_content
-    assert "node --version" not in all_content
-    # No truncated quoted preview for the terminal command.
+    assert "npm install -g hyperframes@latest" not in all_content and "node --version" not in all_content
     assert 'terminal: "' not in all_content
 
 
 @pytest.mark.asyncio
 async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_path):
-    """Verbose mode on a markdown-capable gateway renders the FULL multi-line
-    command in a bare fenced block (no truncation, no 'bash' tag).  This is the
-    parity guarantee for #42634: verbose keeps full detail, non-verbose caps."""
-    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "verbose")
+    """Verbose mode on a markdown-capable gateway renders the FULL multi-line command (#42634)."""
+    all_content = await _run_terminal_progress(monkeypatch, tmp_path, TerminalCommandAgent, "verbose")
+    assert "```" in all_content and "```bash" not in all_content
+    assert "npm install -g hyperframes@latest" in all_content and "node --version" in all_content
 
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = TerminalCommandAgent
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-    import tools.terminal_tool
-
-    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
-    runner = _make_runner(adapter)
-    gateway_run = importlib.import_module("gateway.run")
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
-
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="12345",
-        chat_type="dm",
-        thread_id=None,
-    )
-
-    result = await runner._run_agent(
-        message="hello",
-        context_prompt="",
-        history=[],
-        source=source,
-        session_id="sess-terminal-code-block-verbose",
-        session_key="agent:main:telegram:dm:12345",
-    )
-
-    assert result["final_response"] == "done"
-    all_content = " ".join(call["content"] for call in adapter.sent)
-    all_content += " ".join(call["content"] for call in adapter.edits)
+@pytest.mark.asyncio
+async def test_terminal_progress_python_invocation_wrapper_no_unclosed_quote(monkeypatch, tmp_path):
+    """Multiline python3 -c invocation wrapper combines the wrapper with the
+    first body line and auto-balances quotes, avoiding unclosed quotes or meaningless stubs."""
+    import re
+    all_content = await _run_terminal_progress(monkeypatch, tmp_path, PythonInvocationCommandAgent, "all")
     assert "```" in all_content
-    assert "```bash" not in all_content
-    # Full command body present — verbose is uncapped.
-    assert "npm install -g hyperframes@latest" in all_content
-    assert "node --version" in all_content
+    assert 'python3 -c " import sys' in all_content
+    assert "print(sys.version)" not in all_content
+    code_match = re.search(r"```\n(.*?)\n```", all_content, re.DOTALL)
+    assert code_match is not None
+    block = code_match.group(1).strip()
+    assert block.count('"') % 2 == 0
+    assert block.count("'") % 2 == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_progress_consecutive_commands_merge_into_single_block(monkeypatch, tmp_path):
+    """Consecutive terminal calls merge into a single fenced code block (#70857)."""
+    import re
+    adapter = await _run_terminal_progress(monkeypatch, tmp_path, ConsecutiveTerminalCommandsAgent, "all", return_adapter=True)
+    final_edit = adapter.edits[-1]["content"]
+    assert final_edit.count("```") == 2
+    code_match = re.search(r"```\n(.*?)\n```", final_edit, re.DOTALL)
+    assert code_match is not None and "echo first\necho second" in code_match.group(1)
+
+
+@pytest.mark.asyncio
+async def test_terminal_progress_dedup_keeps_code_block_fences(monkeypatch, tmp_path):
+    """Verify deduplicated terminal commands keep fences and place (×2) inside the fence."""
+    import re
+    adapter = await _run_terminal_progress(monkeypatch, tmp_path, DeduplicatedTerminalCommandsAgent, "all", return_adapter=True)
+    final_edit = adapter.edits[-1]["content"]
+    assert final_edit.count("```") == 2 and final_edit.endswith("\n```")
+    code_match = re.search(r"```\n(.*?)\n```", final_edit, re.DOTALL)
+    assert code_match is not None and "(×2)" in code_match.group(1)
 
 
 @pytest.mark.asyncio
@@ -2121,12 +2124,7 @@ async def test_per_platform_streaming_does_not_override_global_disabled(monkeypa
     Covers both gate sites: TurnRunner.want_stream_deltas (normal agent path) and
     GatewayTurnMixin._proxy_stream_consumer (proxy / native-streaming path)."""
     config_data = {
-        "display": {
-            "platforms": {
-                "telegram": {"streaming": True},
-            },
-            "interim_assistant_messages": False,
-        },
+        "display": {"platforms": {"telegram": {"streaming": True}}, "interim_assistant_messages": False},
         "streaming": {"enabled": False},
     }
     if path == "proxy":

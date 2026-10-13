@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- telegram markdown to html fallback
 """Telegram platform adapter (python-telegram-bot): inbound messages/media/commands, outbound replies."""
 
 import asyncio
@@ -388,6 +389,56 @@ def _strip_mdv2(text: str) -> str:
     cleaned = re.sub(r'~([^~]+)~', r'\1', cleaned)  # strikethrough
     cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)  # spoiler
     return cleaned
+
+
+def _md_to_tg_html(raw_or_mdv2: str) -> str:
+    """Safe HTML fallback converter for Telegram when MarkdownV2 parse fails.
+    Preserves fenced code blocks, inline code, bold, italic, strikethrough, links,
+    and spoilers without triggering MarkdownV2 entity errors.
+    """
+    import html as _html
+    # Unescape escaped MarkdownV2 punctuation while preserving markdown asterisks/backticks
+    text = re.sub(r'\\([_*[\]()~`>#\+\-=|{}.!\\])', r'\1', raw_or_mdv2)
+    placeholders: dict[str, str] = {}
+    counter = [0]
+
+    def _ph(val: str) -> str:
+        k = f"\x00HTML{counter[0]}\x00"
+        counter[0] += 1
+        placeholders[k] = val
+        return k
+
+    def _sub_fence(m):
+        lang = m.group(2).strip() if m.group(2) else ""
+        code = _html.escape(m.group(3))
+        if lang and lang.lower() not in {"text", "txt"}:
+            tag = f'<pre><code class="language-{_html.escape(lang)}">{code}</code></pre>'
+        else:
+            tag = f'<pre>{code}</pre>'
+        return m.group(1) + _ph(tag)
+
+    text = re.sub(r'(?m)^([ \t]*)(?:```([^\n]*)\n)([\s\S]*?)(?:^[ \t]*```)[ \t]*\r?$', _sub_fence, text)
+    text = re.sub(r'`([^`\n]+)`', lambda m: _ph(f'<code>{_html.escape(m.group(1))}</code>'), text)
+    text = _html.escape(text)
+
+    def _sub_link(m):
+        link_text = m.group(1)
+        target_url = m.group(2).strip()
+        if re.match(r'^(?:https?://|tg://)', target_url):
+            return _ph(f'<a href="{_html.escape(target_url)}">{link_text}</a>')
+        return m.group(0)
+
+    text = re.sub(r'\[([^\]]+)\]\(([^()]+)\)', _sub_link, text)
+    text = re.sub(r'(?m)^#{1,6}\s+(.+)$', r'<b>\1</b>', text)
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'(?<!\w)\*([^*\n]+)\*(?!\w)', r'<i>\1</i>', text)
+    text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
+    text = re.sub(r'\|\|(.+?)\|\|', r'<tg-spoiler>\1</tg-spoiler>', text)
+
+    for k in reversed(list(placeholders.keys())):
+        text = text.replace(k, placeholders[k])
+
+    return text
 
 
 _CHUNK_INDICATOR_ON_FENCE_RE = re.compile(r'(?m)^``` (?P<indicator>(?:\\)?\(\d+/\d+(?:\\)?\))$')
@@ -3466,10 +3517,17 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
         except Exception as md_error:
             if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
-                logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-                return await _await_with_thread_deadline(
-                    self._bot.send_message(text=_strip_mdv2(chunk), parse_mode=None, **send_kwargs),
-                    timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+                logger.warning("[%s] MarkdownV2 parse failed, falling back to HTML: %s", self.name, md_error)
+                try:
+                    html_text = _md_to_tg_html(chunk)
+                    return await _await_with_thread_deadline(
+                        self._bot.send_message(text=html_text, parse_mode=ParseMode.HTML, **send_kwargs),
+                        timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+                except Exception as html_err:
+                    logger.warning("[%s] HTML fallback failed, falling back to plain text: %s", self.name, html_err)
+                    return await _await_with_thread_deadline(
+                        self._bot.send_message(text=_strip_mdv2(chunk), parse_mode=None, **send_kwargs),
+                        timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
             raise
 
     async def _send_chunk_with_retries(
@@ -3813,7 +3871,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             if "not modified" in str(fmt_err).lower():
                 return True
             logger.warning(warn_fmt, self.name, _redact_telegram_error_text(fmt_err))
-            await self._edit_text(chat_id, message_id, plain)
+            try:
+                html_text = _md_to_tg_html(formatted or plain)
+                await self._edit_text(chat_id, message_id, html_text, ParseMode.HTML)
+                return False
+            except Exception as html_err:
+                if "not modified" in str(html_err).lower():
+                    return True
+                logger.warning("[%s] HTML edit fallback failed, falling back to plain text: %s", self.name, _redact_telegram_error_text(html_err))
+                await self._edit_text(chat_id, message_id, plain)
         return False
 
     async def edit_message(
@@ -3963,16 +4029,18 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         """Send one continuation chunk (MarkdownV2 then plain on finalize; raw when streaming); drops the
         reply anchor once on 'reply message not found'. Returns the sent message or None."""
         base = {**self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
-        for use_markdown in (True, False) if finalize else (False,):
+        modes = [(True, ParseMode.MARKDOWN_V2), (True, ParseMode.HTML), (False, None)] if finalize else [(False, None)]
+        for use_formatting, p_mode in modes:
             try:
-                if use_markdown:
+                if p_mode == ParseMode.MARKDOWN_V2:
                     text = _separate_chunk_indicator_from_fence(self.format_message(chunk))
+                elif p_mode == ParseMode.HTML:
+                    text = _md_to_tg_html(chunk)
                 else:
-                    # Degrade to stripped text on finalize (raw ** / ``` would render literally); previews stay raw.
                     text = _strip_mdv2(chunk) if finalize else chunk
                 return await _await_with_thread_deadline(
                     self._bot.send_message(
-                    chat_id=normalize_telegram_chat_id(chat_id), text=text, parse_mode=ParseMode.MARKDOWN_V2 if use_markdown else None,
+                    chat_id=normalize_telegram_chat_id(chat_id), text=text, parse_mode=p_mode,
                     reply_to_message_id=reply_to_id, **thread_kwargs, **base),
                     timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
             except Exception as send_err:
@@ -5629,28 +5697,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         text = _wrap_markdown_tables(content)
 
         # 1) Protect fenced code blocks (``` ... ```)
-        #    Per MarkdownV2 spec, \ and ` inside pre/code must be escaped.
-        #    A fence still opens on its own line — the opening ``` must be the
-        #    first triple-backtick run on that line and must end it — but the
-        #    line may carry arbitrary leading whitespace (list/blockquote-
-        #    nested code indents fences by 4+ spaces) or lead-in prose
-        #    ("Here is the code: ```"), both of which the line-start-only
-        #    anchor silently downgraded from <pre> to escaped literal text.
-        #    Requiring the rest of the opening line to be backtick-free is
-        #    what keeps *inline* triple backticks (e.g. "the syntax is
-        #    ```x``` inline") out of the match: a closing run can never sit
-        #    on the same line as the opener, and the tempered prefix cannot
-        #    skip past an earlier run to a later one.  The closing fence must
-        #    sit on its own line (any indent), with optional trailing
-        #    whitespace and an optional ``\r`` so CRLF-terminated fences
-        #    (Windows-authored content) match too.
+        #    Per MarkdownV2 spec, \ and ` inside pre/code must be escaped. Fences open on their
+        #    own line (with optional indent/prose), but closing fence cannot share the same line.
         def _protect_fenced(m):
-            prefix = m.group(1)   # lead-in text / indent before the opening fence
-            opening = m.group(2)  # opening ``` (with optional language) and newline
-            body = m.group(3)     # code body (may be empty)
-            closing = m.group(4)   # closing fence (with its indent)
-            body = body.replace('\\', '\\\\').replace('`', '\\`')
-            return prefix + _ph(opening + body + closing)
+            body = m.group(3).replace('\\', '\\\\').replace('`', '\\`')
+            return m.group(1) + _ph(m.group(2) + body + m.group(4))
 
         text = re.sub(
             r'(?m)^((?:(?!```)[^\n])*)(```[^`\n]*\n)([\s\S]*?)(^[ \t]*```)[ \t]*\r?$',
@@ -5658,13 +5709,17 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             text,
         )
 
-        # 2) Protect inline code (`...`)
-        #    Escape \ inside inline code per MarkdownV2 spec.
-        text = re.sub(
-            r'(`[^`]+`)',
-            lambda m: _ph(m.group(0).replace('\\', '\\\\')),
-            text,
-        )
+        # 2a) Protect double-backtick code spans (``...``) which may enclose single backticks
+        def _protect_double_backtick(m):
+            raw = m.group(1)
+            if raw.startswith(' ') and raw.endswith(' ') and raw.strip():
+                raw = raw[1:-1]
+            inner = raw.replace('\\', '\\\\').replace('`', '\\`')
+            return _ph('`' + inner + (' ' if inner.endswith('\\`') else '') + '`')
+
+        text = re.sub(r'(?<!`)``((?:(?!``)[^\n])+)``(?!`)', _protect_double_backtick, text)
+        # 2b) Protect single-backtick inline code (`...`) — must not span newlines
+        text = re.sub(r'(?<!`)(`[^`\n]+`)(?!`)', lambda m: _ph(m.group(1).replace('\\', '\\\\')), text)
 
         # 3) Convert markdown links – escape the display text; inside the URL
         #    only ')' and '\' need escaping per the MarkdownV2 spec.
@@ -5700,7 +5755,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             text = text.replace(key, placeholders[key])
         # 12) Safety net: escape bare ( ) { } that slipped through, but never inside ``` or ` spans.
         _safe_parts = []
-        for _idx, _seg in enumerate(re.split(r'(```[\s\S]*?```|`[^`]+`)', text)):
+        for _idx, _seg in enumerate(re.split(r'(```[\s\S]*?```|`(?:\\.|[^`\\])+`)', text)):
             if _idx % 2 == 1:
                 _safe_parts.append(_seg)  # inside code — untouched
             else:

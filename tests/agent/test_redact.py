@@ -1633,3 +1633,12 @@ class TestRedactForEgress:
         from agent import redact as R
         monkeypatch.setattr(R, "redact_sensitive_text", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
         assert R.redact_for_egress("sk-live-0123456789abcdef") == R.REDACTION_UNAVAILABLE
+
+    def test_auth_and_secret_headers_preserve_closing_delimiters(self):
+        from agent.redact import redact_sensitive_text
+        # Backticks around headers in markdown must not lose their closing backtick
+        assert "`Authorization: Bearer ***`" in redact_sensitive_text("Use `Authorization: Bearer secret_token_123` in request")
+        assert "`x-api-key: ***`" in redact_sensitive_text("Set `x-api-key: secret_token_123` header")
+        # Quotes around headers must not lose their closing quote
+        assert '"Authorization: Bearer ***"' in redact_sensitive_text('curl -H "Authorization: Bearer secret_token_123"')
+        assert "'x-api-key: ***'" in redact_sensitive_text("curl -H 'x-api-key: secret_token_123'")

@@ -402,6 +402,21 @@ def compile_mention_patterns(raw, *, log_prefix: str, platform_label: str | None
 # yuanbao (``prefer_paragraphs=True, balance_fences=False``) and weixin (``greedy_pack_blocks``).
 
 
+def unclosed_quote(s: str) -> Optional[str]:
+    """Return the unclosed quote character ('"' or "'") if *s* has an unclosed quote, else None."""
+    q = None
+    for i, ch in enumerate(s):
+        if q is None and ch in ('"', "'"):
+            q = ch
+        elif ch == q:
+            k = i - 1
+            while k >= 0 and s[k] == '\\':
+                k -= 1
+            if q != '"' or (i - 1 - k) % 2 == 0:
+                q = None
+    return q
+
+
 def text_has_unclosed_fence(text: str) -> bool:
     """Return True when *text* ends inside an unclosed ``` code fence."""
     return sum(line.startswith('```') for line in text.split('\n')) % 2 == 1

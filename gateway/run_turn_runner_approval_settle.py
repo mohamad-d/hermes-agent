@@ -77,7 +77,10 @@ async def _edit_card(adapter, chat_id: str, message_id: str, content: str) -> bo
     if edit is None:
         return False
     try:
-        result = await edit(chat_id, message_id, content)
+        try:
+            result = await edit(chat_id, message_id, content, finalize=True)
+        except TypeError:
+            result = await edit(chat_id, message_id, content)
     except Exception:
         logger.debug("Approval card edit failed; sending the notice as a new message", exc_info=True)
         return False

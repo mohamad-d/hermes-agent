@@ -203,6 +203,20 @@ class TestFormatMessageCodeBlocks:
         # ...and exactly the one real block's two fences remain.
         assert result.count("```") == 2
 
+    def test_inline_code_does_not_span_newlines(self, adapter):
+        """Unclosed inline code on one line must not swallow subsequent lines."""
+        text = "Line 1 with stray `backtick\n\nLine 2 with `valid` code"
+        result = adapter.format_message(text)
+        assert "`valid`" in result
+        assert "Line 2" in result
+        assert r"\`backtick" in result
+
+    def test_double_backtick_code_span_with_nested_single_backtick(self, adapter):
+        """Double backtick code span enclosing a backtick must escape the inner backtick."""
+        text = "Use `` ` `` to write a literal backtick in markdown"
+        result = adapter.format_message(text)
+        assert r"`\` `" in result
+
 
 @pytest.mark.asyncio
 async def test_final_send_does_not_retrigger_typing(adapter):
@@ -729,3 +743,48 @@ class TestTelegramGuestMentionGating:
         message.caption_entities = [_guest_mention_entity(text)]
 
         assert adapter._should_process_message(message) is True
+
+
+# =========================================================================
+# HTML fallback tests
+# =========================================================================
+
+
+class TestTelegramHtmlFallback:
+    def test_md_to_tg_html_converts_fenced_code_blocks(self):
+        from plugins.platforms.telegram.adapter import _md_to_tg_html
+        md = "```python\ndef foo():\n    return 42\n```"
+        html_out = _md_to_tg_html(md)
+        assert '<pre><code class="language-python">' in html_out
+        assert "def foo():" in html_out
+        assert "</code></pre>" in html_out
+
+    def test_md_to_tg_html_converts_inline_code_and_bold(self):
+        from plugins.platforms.telegram.adapter import _md_to_tg_html
+        md = "Run `git status` for **bold result**"
+        html_out = _md_to_tg_html(md)
+        assert "<code>git status</code>" in html_out
+        assert "<b>bold result</b>" in html_out
+
+    @pytest.mark.asyncio
+    async def test_send_falls_back_to_html_on_markdownv2_error(self, adapter):
+        from unittest.mock import AsyncMock, MagicMock
+        from telegram.constants import ParseMode
+
+        adapter._bot = MagicMock()
+        # First call (MarkdownV2) raises parse error, second call (HTML) succeeds
+        adapter._bot.send_message = AsyncMock(
+            side_effect=[
+                Exception("Can't parse entities: character '{' is reserved"),
+                MagicMock(message_id=42),
+            ]
+        )
+        chunk = "code: {foo}"
+        msg, _ = await adapter._send_chunk_with_retries(
+            "12345", chunk, 0, None, None, None, False, adapter._telegram_error_types()
+        )
+        assert msg.message_id == 42
+        assert adapter._bot.send_message.call_count == 2
+        # Verify second call used ParseMode.HTML
+        call_kwargs = adapter._bot.send_message.call_args_list[1].kwargs
+        assert call_kwargs.get("parse_mode") == ParseMode.HTML

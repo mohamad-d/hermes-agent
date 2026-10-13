@@ -239,27 +239,30 @@ class TurnRunner:
         return pl if pl > 0 else 40
 
     def _progress_terminal_blocks(self, adapter, tool_name, args, emoji):
-        """(full, short) fenced blocks for a terminal command on markdown platforms, else (None, None).
-
-        No language tag: Slack mrkdwn renders it as a literal first code line. Verbose shows the FULL
-        command; "all"/"new" truncate to one line capped at ``tool_preview_length``. Consecutive
-        terminal calls drop the repeated header so back-to-back commands render as adjacent blocks.
-        """
+        """(full, short) fenced blocks for a terminal command on markdown platforms, else (None, None)."""
         if not (
-            getattr(adapter, "supports_code_blocks", False) and tool_name == "terminal" and isinstance(args, dict)
-            and isinstance(args.get("command"), str) and args["command"].strip()
+            getattr(adapter, "supports_code_blocks", False) and tool_name == "terminal"
+            and isinstance(args, dict) and isinstance(args.get("command"), str) and args["command"].strip()
         ):
             return None, None
         cmd_full = args["command"].rstrip()
         header = "" if self._ctx.last_was_terminal_block[0] else t("gateway.progress.tool_head", emoji=emoji, tool=tool_name) + "\n"
-        cap = self._preview_cap()
-        lines = cmd_full.splitlines()
-        cmd_short = lines[0] if lines else cmd_full
-        if len(cmd_short) > cap:
-            cmd_short = cmd_short[:cap - 3] + "..."
-        elif len(lines) > 1:
-            cmd_short += " ..."
-        return f"{header}```\n{cmd_full}\n```", f"{header}```\n{cmd_short}\n```"
+        cap, lines = self._preview_cap(), cmd_full.splitlines()
+        first = lines[0].strip() if lines else cmd_full
+        while True:
+            s = re.sub(r"^cd\s+(?:'[^']*'|\"[^\"]*\"|[^&;\n])*\s*&&\s*", "", first)
+            s = re.sub(r"^env(?:\s+-u\s+\S+)+\s*", "", s)
+            s = re.sub(r"^(?:/\S+)?/(python[\d.]*)\b", r"\1", s)
+            if s == first:
+                break
+            first = s
+        from gateway.platforms.helpers import unclosed_quote
+        wrapper = len(lines) > 1 and unclosed_quote(first) and re.search(r'-[ce]\s*\$?["\']+$', first)
+        cmd_short = f"{first} {lines[1].strip()}" if wrapper else first
+        has_more = len(lines) > (2 if wrapper else 1)
+        cmd_short = cmd_short[:cap - 3] + "..." if len(cmd_short) > cap else (cmd_short + " ..." if has_more else cmd_short)
+        q = unclosed_quote(cmd_short)
+        return f"{header}```\n{cmd_full}\n```", f"{header}```\n{cmd_short + (q or '')}\n```"
 
     def _progress_build_message(self, tool_name, preview, args) -> Optional[str]:
         """Render the progress line. Verbose mode queues directly (no dedup) and returns None."""
@@ -302,7 +305,6 @@ class TurnRunner:
         if not verb:
             return t("gateway.progress.tool_preview", emoji=emoji, tool=tool_name, preview=preview)
         return f"{emoji} {verb}" if verb_drops_preview(tool_name) else f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview}"
-
     def _progress_emit(self, msg: str) -> None:
         """Dedup consecutive identical lines (execute_code boilerplate), then route to the native
         stream bubble when the consumer accepts tool progress, else the progress queue."""
@@ -400,11 +402,9 @@ class TurnRunner:
             # _send_progress_text and re-sent the same task text to the refused
             # chat. The decline must set the terminal state here too.
             if declined_send(result):
-                logger.warning(
-                    "Task-card fallback edit DECLINED by the connector's egress "
-                    "guard; suppressing progress delivery for the rest of this "
-                    "turn (the destination is not approved)"
-                )
+                logger.warning("Task-card fallback edit DECLINED by the connector's egress "
+                               "guard; suppressing progress delivery for the rest of this "
+                               "turn (the destination is not approved)")
                 st.publication_suppressed = True
                 return
         result = await self._send_progress_text(st, text)
@@ -451,11 +451,9 @@ class TurnRunner:
                 # after one tick.
                 st.publication_suppressed = True
                 st.native_failed = True
-                logger.warning(
-                    "Slack native task-card progress DECLINED by the connector's "
-                    "egress guard — suppressing the text fallback for the rest "
-                    "of this turn (the destination is not approved)"
-                )
+                logger.warning("Slack native task-card progress DECLINED by the connector's "
+                               "egress guard — suppressing the text fallback for the rest "
+                               "of this turn (the destination is not approved)")
                 return
             st.native_failed = True
             if getattr(result, "error", None) in _CARD_DESTINATION_REFUSALS:
@@ -463,10 +461,8 @@ class TurnRunner:
                 if st.publication_suppressed:
                     return
             else:
-                logger.warning(
-                    "Slack native task-card progress failed; falling back "
-                    "to an editable text update: %s", getattr(result, "error", "unknown error"),
-                )
+                logger.warning("Slack native task-card progress failed; falling back "
+                               "to an editable text update: %s", getattr(result, "error", "unknown error"))
         # Once the native rail fails, every later lifecycle event edits the same fallback message.
         await self._task_card_send_or_edit_fallback(st)
 
@@ -478,16 +474,12 @@ class TurnRunner:
         ``new``/``all`` asked for text progress, so the editable fallback carries it instead."""
         if self._ctx.tool_progress_enabled:
             st.native_failed = True
-            logger.info(
-                "Slack native task cards are unsupported for this destination (%s); "
-                "tool progress continues as an editable text update", reason,
-            )
+            logger.info("Slack native task cards are unsupported for this destination (%s); "
+                        "tool progress continues as an editable text update", reason)
             return
         st.publication_suppressed = True
-        logger.info(
-            "Slack native task cards are unsupported for this destination (%s); "
-            "tool progress stays off for this turn", reason,
-        )
+        logger.info("Slack native task cards are unsupported for this destination (%s); "
+                    "tool progress stays off for this turn", reason)
 
     def _task_card_drain(self, st) -> bool:
         changed = False
@@ -649,7 +641,19 @@ class TurnRunner:
             _, base_msg, count = raw
             if not st.progress_lines:
                 return base_msg
-            st.progress_lines[-1] = f"{base_msg} (×{count + 1})"
+            last = st.progress_lines[-1]
+            if isinstance(last, str) and last.endswith("\n```"):
+                prev = re.sub(r"\s*\(×\d+\)$", "", last[:-4])
+                st.progress_lines[-1] = f"{prev} (×{count + 1})\n```"
+            else:
+                base = re.sub(r"\s*\(×\d+\)$", "", str(last))
+                st.progress_lines[-1] = f"{base} (×{count + 1})"
+            return st.progress_lines[-1]
+        if (
+            isinstance(raw, str) and raw.startswith("```\n") and raw.endswith("\n```")
+            and st.progress_lines and isinstance(st.progress_lines[-1], str) and st.progress_lines[-1].endswith("\n```")
+        ):
+            st.progress_lines[-1] = f"{st.progress_lines[-1][:-4]}\n{raw[4:-4]}\n```"
             return st.progress_lines[-1]
         st.progress_lines.append(raw)
         return raw
@@ -777,9 +781,7 @@ class TurnRunner:
         if adapter is None or not hasattr(adapter, "play_ack_in_voice"):
             return
         try:
-            self._schedule(
-                adapter.play_ack_in_voice(ctx._voice_ack_guild[0]), "voice ack scheduling error", loop=ctx._voice_ack_loop,
-            )
+            self._schedule(adapter.play_ack_in_voice(ctx._voice_ack_guild[0]), "voice ack scheduling error", loop=ctx._voice_ack_loop)
         except Exception as err:
             logger.debug("voice ack schedule failed: %s", err)
 
@@ -833,14 +835,11 @@ class TurnRunner:
         # prev_tools may be list[str] or list[dict] with "name"/"result" keys. Normalise so
         # "tool_names" stays backward-compatible for user hooks that do ', '.join(tool_names).
         names = [(t.get("name") or "") if isinstance(t, dict) else str(t) for t in (prev_tools or [])]
-        self._schedule(
-            ctx._hooks_ref.emit("agent:step", {
-                "platform": ctx.source.platform.value if ctx.source.platform else "",
-                "user_id": ctx.source.user_id, "session_id": ctx.session_id,
-                "iteration": iteration, "tool_names": names, "tools": prev_tools,
-            }),
-            "agent:step hook scheduling error",
-        )
+        self._schedule(ctx._hooks_ref.emit("agent:step", {
+            "platform": ctx.source.platform.value if ctx.source.platform else "",
+            "user_id": ctx.source.user_id, "session_id": ctx.session_id,
+            "iteration": iteration, "tool_names": names, "tools": prev_tools,
+        }), "agent:step hook scheduling error")
 
     def _event_callback_sync(self, event_type: str, context: dict) -> None:
         ctx = self._ctx
@@ -1071,19 +1070,12 @@ class TurnRunner:
             # Re-validate the outside-lock dead-session peek against the tuple read under THIS lock:
             # a stale "dead" verdict must never be applied to a different (possibly live) agent.
             if sid_mismatch and dead and cached_sid == peek_sid:
-                logger.info(
-                    "Agent cache invalidated for session %s: "
-                    "cached agent's session_id %s is ended in "
-                    "state.db (stale self-heal artifact, "
-                    "#54878 x #54947) — discarding instead of "
-                    "reusing across the routing recovery", ctx.session_key, cached_sid,
-                )
+                logger.info("Agent cache invalidated for session %s: cached agent's session_id %s is ended in "
+                            "state.db (stale self-heal artifact, #54878 x #54947) — discarding instead of "
+                            "reusing across the routing recovery", ctx.session_key, cached_sid)
             elif not sid_mismatch and cached_mc is not None and msg_count is not None and msg_count != cached_mc:
-                logger.info(
-                    "Agent cache invalidated for session %s: "
-                    "message_count changed (%s -> %s), "
-                    "possible cross-process write", ctx.session_key, cached_mc, msg_count,
-                )
+                logger.info("Agent cache invalidated for session %s: message_count changed (%s -> %s), "
+                            "possible cross-process write", ctx.session_key, cached_mc, msg_count)
             else:
                 out.agent = cached[0]
                 # Refresh LRU order so cap enforcement evicts truly-oldest entries.
